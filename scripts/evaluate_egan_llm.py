@@ -107,11 +107,19 @@ def main():
         cik = row['CIK']
         year = row['Year']
         true_rating_str = row['Rating']
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from threading import Lock
+
+    results_lock = Lock()
+    
+    def process_sample(row):
+        cik = row['CIK']
+        year = row['Year']
+        true_rating_str = row['Rating']
         
         text = get_extracted_text(cik, year, data_dir)
         if not text:
-            missing_files += 1
-            continue
+            return "missing"
             
         system_prompt = "You are an expert corporate credit rating agency. Evaluate the following extracted sections from a company's SEC 10-K and strictly predict the corporate credit rating."
         user_prompt = f"SEC 10-K Extracts:\n{text}\n\nPredict the corporate credit rating. You must select exactly one rating from these options: {', '.join(VALID_RATINGS)}.\nOutput ONLY a valid JSON object in the exact format: {{\"predicted_rating\": \"<rating>\"}}"
@@ -122,10 +130,8 @@ def main():
         ]
         
         try:
-            # Query the local LLM server
-            # Since these texts can be huge, you might want to slice them if your context window complains
-            # 16000 tokens ~ 60,000 characters. 
-            max_chars = 50000 
+            # Drastically reduced from 50k to 15k chars to speed up prefill time
+            max_chars = 15000 
             messages[1]["content"] = user_prompt[:max_chars] + ("\n... [truncated]" if len(user_prompt) > max_chars else "")
             
             payload = {
@@ -145,25 +151,38 @@ def main():
             
         except Exception as e:
             logging.error(f"API Request failed for CIK {cik} Year {year}: {e}")
-            continue
+            return "error"
         
         predicted_rating_str = parse_llm_output(response_text)
         
         if predicted_rating_str and true_rating_str in RATING_MAP:
-            y_true_22.append(RATING_MAP[true_rating_str])
-            y_pred_22.append(RATING_MAP[predicted_rating_str])
-            
-            y_true_6.append(get_macro_bucket(true_rating_str))
-            y_pred_6.append(get_macro_bucket(predicted_rating_str))
-            
-            results.append({
-                "CIK": cik,
-                "Year": year,
-                "True_Rating": true_rating_str,
-                "Predicted_Rating": predicted_rating_str,
-                "Raw_LLM_Output": response_text.strip()
-            })
-            evaluated += 1
+            with results_lock:
+                y_true_22.append(RATING_MAP[true_rating_str])
+                y_pred_22.append(RATING_MAP[predicted_rating_str])
+                
+                y_true_6.append(get_macro_bucket(true_rating_str))
+                y_pred_6.append(get_macro_bucket(predicted_rating_str))
+                
+                results.append({
+                    "CIK": cik,
+                    "Year": year,
+                    "True_Rating": true_rating_str,
+                    "Predicted_Rating": predicted_rating_str,
+                    "Raw_LLM_Output": response_text.strip()
+                })
+            return "success"
+        return "error"
+
+    # Run concurrently with up to 16 threads
+    with ThreadPoolExecutor(max_workers=16) as executor:
+        futures = {executor.submit(process_sample, row): idx for idx, row in df.iterrows()}
+        for future in tqdm(as_completed(futures), total=len(df), desc="Evaluating Egan SEC Filings"):
+            res = future.result()
+            if res == "missing":
+                missing_files += 1
+            elif res == "success":
+                evaluated += 1
+
             
     if missing_files > 0:
         logging.warning(f"Skipped {missing_files} rows because the SEC extracted text file was missing.")
