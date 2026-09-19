@@ -39,7 +39,8 @@ def get_text_for_sample(cik, year, data_dir):
     """
     Load the extracted qualitative features (RAPTOR summaries) for a given CIK and Year.
     """
-    feature_path = data_dir / "qualitative_features" / f"{cik}_{year}_features.json"
+    cik_str = str(cik).zfill(10)
+    feature_path = data_dir / "qualitative_features" / f"{cik_str}_{year}_features.json"
     
     if feature_path.exists():
         try:
