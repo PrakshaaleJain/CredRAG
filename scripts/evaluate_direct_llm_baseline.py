@@ -9,8 +9,7 @@ import numpy as np
 from pathlib import Path
 from tqdm import tqdm
 from sklearn.metrics import accuracy_score, f1_score, mean_absolute_error
-import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+import requests
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
 
@@ -126,31 +125,9 @@ def main():
     test_df = merged_df.iloc[split_idx:].copy()
     logging.info(f"Test split size: {len(test_df)} samples")
     
-    # Load Model with 4-bit Quantization and FlashAttention-2 to fit 24GB VRAM
-    logging.info("Loading Llama-3.1-8B-Instruct (4-bit, FlashAttention-2)...")
-    model_id = "meta-llama/Llama-3.1-8B-Instruct"
-    
-    quantization_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_compute_dtype=torch.bfloat16,
-        bnb_4bit_use_double_quant=True,
-        bnb_4bit_quant_type="nf4"
-    )
-    
-    try:
-        tokenizer = AutoTokenizer.from_pretrained(model_id)
-        tokenizer.pad_token = tokenizer.eos_token
-        
-        model = AutoModelForCausalLM.from_pretrained(
-            model_id,
-            quantization_config=quantization_config,
-            device_map="auto",
-            torch_dtype=torch.bfloat16,
-            attn_implementation="flash_attention_2"
-        )
-    except Exception as e:
-        logging.error(f"Failed to load model. Do you have access to Llama 3.1 and flash-attn installed? Error: {e}")
-        return
+    # Use local LLM API endpoint
+    api_url = "http://localhost:8000/v1/chat/completions"
+    logging.info(f"Using local LLM Server at {api_url} (e.g. llama-cpp-python or vLLM)")
 
     results = []
     y_true_22 = []
@@ -178,23 +155,27 @@ def main():
             {"role": "user", "content": user_prompt}
         ]
         
-        # Format the chat prompt and tokenize
-        prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        # Truncate context heavily to ensure it fits in 24GB VRAM. 16k is a safe threshold for 4-bit 8B models.
-        inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=16000).to(model.device)
-        
-        with torch.no_grad():
-            outputs = model.generate(
-                **inputs,
-                max_new_tokens=20,
-                temperature=0.0,    # Greedy decoding for deterministic behavior
-                do_sample=False,
-                pad_token_id=tokenizer.eos_token_id
+        try:
+            # Query the local LLM server
+            payload = {
+                "messages": messages,
+                "temperature": 0.0,
+                "max_tokens": 20,
+            }
+            response = requests.post(
+                api_url, 
+                json=payload,
+                headers={"Content-Type": "application/json"}
             )
+            response.raise_for_status()
             
-        # Extract only the generated tokens
-        generated_tokens = outputs[0][inputs.input_ids.shape[-1]:]
-        response_text = tokenizer.decode(generated_tokens, skip_special_tokens=True)
+            # Extract generated response
+            response_data = response.json()
+            response_text = response_data['choices'][0]['message']['content']
+            
+        except Exception as e:
+            logging.error(f"API Request failed for CIK {cik} Year {year}: {e}")
+            continue
         
         # Parse output
         predicted_rating_str = parse_llm_output(response_text)
