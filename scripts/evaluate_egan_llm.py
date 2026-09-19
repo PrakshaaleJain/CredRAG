@@ -81,6 +81,7 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
     
     labels_csv = data_dir / 'egan_training_labels.csv'
+    checkpoint_file = out_dir / 'egan_llm_results_checkpoint.jsonl'
     
     if not labels_csv.exists():
         logging.error(f"Missing {labels_csv}. Run extract_egan_labels.py first.")
@@ -90,23 +91,35 @@ def main():
     df['Year'] = df['Year'].astype(str)
     df = df[(df['Rating'] != 'NR')]
     
+    # Load already evaluated samples from checkpoint
+    completed_keys = set()
+    all_results = []
+    if checkpoint_file.exists():
+        with open(checkpoint_file, 'r') as f:
+            for line in f:
+                if line.strip():
+                    try:
+                        res = json.loads(line)
+                        completed_keys.add(f"{res['CIK']}_{res['Year']}")
+                        all_results.append(res)
+                    except json.JSONDecodeError:
+                        pass
+        logging.info(f"Loaded {len(completed_keys)} already evaluated samples from checkpoint.")
+        
+    # Filter out already evaluated
+    df['run_key'] = df['CIK'].astype(str) + "_" + df['Year'].astype(str)
+    df_to_run = df[~df['run_key'].isin(completed_keys)]
+    logging.info(f"{len(df_to_run)} samples remaining to evaluate.")
+    
     api_url = "http://localhost:8000/v1/chat/completions"
     logging.info(f"Using local LLM Server at {api_url}")
 
     results = []
-    y_true_22 = []
-    y_pred_22 = []
-    y_true_6 = []
-    y_pred_6 = []
     
     # Track missing to warn user
     missing_files = 0
     evaluated = 0
     
-    for _, row in tqdm(df.iterrows(), total=len(df), desc="Evaluating Egan SEC Filings"):
-        cik = row['CIK']
-        year = row['Year']
-        true_rating_str = row['Rating']
     from concurrent.futures import ThreadPoolExecutor, as_completed
     from threading import Lock
 
@@ -156,27 +169,25 @@ def main():
         predicted_rating_str = parse_llm_output(response_text)
         
         if predicted_rating_str and true_rating_str in RATING_MAP:
+            result_obj = {
+                "CIK": cik,
+                "Year": year,
+                "True_Rating": true_rating_str,
+                "Predicted_Rating": predicted_rating_str,
+                "Raw_LLM_Output": response_text.strip()
+            }
             with results_lock:
-                y_true_22.append(RATING_MAP[true_rating_str])
-                y_pred_22.append(RATING_MAP[predicted_rating_str])
-                
-                y_true_6.append(get_macro_bucket(true_rating_str))
-                y_pred_6.append(get_macro_bucket(predicted_rating_str))
-                
-                results.append({
-                    "CIK": cik,
-                    "Year": year,
-                    "True_Rating": true_rating_str,
-                    "Predicted_Rating": predicted_rating_str,
-                    "Raw_LLM_Output": response_text.strip()
-                })
+                results.append(result_obj)
+                # Write incrementally to checkpoint file
+                with open(checkpoint_file, 'a') as f:
+                    f.write(json.dumps(result_obj) + '\n')
             return "success"
         return "error"
 
     # Run concurrently with up to 16 threads
     with ThreadPoolExecutor(max_workers=16) as executor:
-        futures = {executor.submit(process_sample, row): idx for idx, row in df.iterrows()}
-        for future in tqdm(as_completed(futures), total=len(df), desc="Evaluating Egan SEC Filings"):
+        futures = {executor.submit(process_sample, row): idx for idx, row in df_to_run.iterrows()}
+        for future in tqdm(as_completed(futures), total=len(df_to_run), desc="Evaluating Egan SEC Filings"):
             res = future.result()
             if res == "missing":
                 missing_files += 1
@@ -187,10 +198,26 @@ def main():
     if missing_files > 0:
         logging.warning(f"Skipped {missing_files} rows because the SEC extracted text file was missing.")
         
-    if evaluated == 0:
+    all_results.extend(results)
+    
+    if len(all_results) == 0:
         logging.error("No samples were successfully evaluated.")
         return
         
+    y_true_22 = []
+    y_pred_22 = []
+    y_true_6 = []
+    y_pred_6 = []
+    
+    for res in all_results:
+        t_r = res["True_Rating"]
+        p_r = res["Predicted_Rating"]
+        if t_r in RATING_MAP and p_r in RATING_MAP:
+            y_true_22.append(RATING_MAP[t_r])
+            y_pred_22.append(RATING_MAP[p_r])
+            y_true_6.append(get_macro_bucket(t_r))
+            y_pred_6.append(get_macro_bucket(p_r))
+
     # Calculate and output metrics
     mae_22 = mean_absolute_error(y_true_22, y_pred_22)
     acc_22 = accuracy_score(y_true_22, y_pred_22)
@@ -203,7 +230,7 @@ def main():
     print("\n" + "="*50)
     print("EGAN DATASET: DIRECT LLM BASELINE METRICS")
     print("="*50)
-    print(f"Total Evaluated: {evaluated}")
+    print(f"Total Evaluated: {len(all_results)}")
     print("\n--- 22-Notch Scale ---")
     print(f"Accuracy:         {acc_22:.4f}")
     print(f"Within 1-Notch:   {within_1_22:.4f}")
@@ -216,7 +243,7 @@ def main():
     print("="*50)
 
     with open(out_dir / 'egan_llm_results.json', 'w') as f:
-        json.dump(results, f, indent=4)
+        json.dump(all_results, f, indent=4)
 
 if __name__ == '__main__':
     main()
