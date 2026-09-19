@@ -38,32 +38,32 @@ def get_macro_bucket(rating):
 
 def get_text_for_sample(cik, year, data_dir):
     """
-    Look for the raw text/JSON file for a given CIK and Year in the data directory.
-    This serves as a fallback search mechanism to find the 10-K text.
+    Load the extracted qualitative features (RAPTOR summaries) for a given CIK and Year.
     """
-    paths_to_try = [
-        data_dir / f"{cik}_{year}_10-K_extracted.json",
-        data_dir / "sec_extracted_text" / f"{cik}_{year}_10-K_extracted.json",
-        data_dir / "sec_extracted_text" / f"{cik}_{year}_10K_extracted.json",
-        data_dir / f"{cik}_{year}_10-K_extracted.txt",
-        data_dir / "sec_filings_md" / f"{cik}_{year}_10-K.md"
-    ]
-    for p in paths_to_try:
-        if p.exists():
-            try:
-                with open(p, 'r', encoding='utf-8') as f:
-                    if p.suffix == '.json':
-                        data = json.load(f)
-                        if isinstance(data, dict):
-                            return json.dumps(data)
-                        elif isinstance(data, str):
-                            return data
-                        else:
-                            return str(data)
+    feature_path = data_dir / "qualitative_features" / f"{cik}_{year}_features.json"
+    
+    if feature_path.exists():
+        try:
+            with open(feature_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                
+            # Format the JSON nicely as text for the LLM
+            formatted_text = []
+            if isinstance(data, dict):
+                for dim, content in data.items():
+                    formatted_text.append(f"--- {dim} ---")
+                    if isinstance(content, dict):
+                        for k, v in content.items():
+                            formatted_text.append(f"{k}: {v}")
                     else:
-                        return f.read()
-            except Exception as e:
-                logging.warning(f"Failed to read {p}: {e}")
+                        formatted_text.append(str(content))
+                    formatted_text.append("")
+                return "\n".join(formatted_text)
+            else:
+                return json.dumps(data, indent=2)
+        except Exception as e:
+            logging.warning(f"Failed to read {feature_path}: {e}")
+            
     return None
 
 def parse_llm_output(output_text):
@@ -170,8 +170,8 @@ def main():
             # Skip if file not found locally
             continue
             
-        system_prompt = "You are an expert corporate credit rating agency. Evaluate the following SEC 10-K text and strictly predict the corporate credit rating."
-        user_prompt = f"SEC 10-K Text:\n{text}\n\nPredict the corporate credit rating. You must select exactly one rating from these options: {', '.join(VALID_RATINGS)}.\nOutput ONLY a valid JSON object in the exact format: {{\"predicted_rating\": \"<rating>\"}}"
+        system_prompt = "You are an expert corporate credit rating agency. Evaluate the following extracted qualitative summaries from a company's SEC 10-K and strictly predict the corporate credit rating."
+        user_prompt = f"Extracted Qualitative Features:\n{text}\n\nPredict the corporate credit rating. You must select exactly one rating from these options: {', '.join(VALID_RATINGS)}.\nOutput ONLY a valid JSON object in the exact format: {{\"predicted_rating\": \"<rating>\"}}"
         
         messages = [
             {"role": "system", "content": system_prompt},
